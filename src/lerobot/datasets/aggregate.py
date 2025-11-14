@@ -19,7 +19,10 @@ import logging
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import tqdm
 
 from lerobot.datasets.compute_stats import aggregate_stats
@@ -40,6 +43,46 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
+
+
+def _convert_extension_dtypes_to_lists(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert pandas extension dtype columns to lists so PyArrow can handle them.
+
+    When pandas reads parquet files with HuggingFace extension metadata, it creates
+    PandasArrayExtensionDtype which PyArrow cannot convert back. This function
+    converts those columns to lists which PyArrow can handle.
+
+    Args:
+        df: DataFrame that may contain extension dtypes
+
+    Returns:
+        DataFrame with extension dtypes converted to lists
+    """
+    df_fixed = df.copy()
+
+    for col in df_fixed.columns:
+        col_series = df_fixed[col]
+        dtype = col_series.dtype
+
+        # Check if column has extension dtype
+        is_extension = (
+            hasattr(pd.api.types, "is_extension_array_dtype")
+            and pd.api.types.is_extension_array_dtype(col_series)
+        ) or (
+            hasattr(dtype, "__module__")
+            and "pandas" in str(dtype.__module__)
+            and "Extension" in str(type(dtype))
+        )
+
+        if is_extension:
+            # Convert extension dtype arrays to lists
+            df_fixed[col] = col_series.apply(
+                lambda x: x.tolist()
+                if isinstance(x, np.ndarray)
+                else (list(x) if hasattr(x, "__iter__") and not isinstance(x, str) else x)
+            )
+
+    return df_fixed
 
 
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
@@ -370,7 +413,10 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
-        df = pd.read_parquet(src_path)
+        # Read using PyArrow to preserve extension types
+        table = pq.read_table(src_path)
+        # Convert to DataFrame for manipulation
+        df = table.to_pandas()
         df = update_data_df(df, src_meta, dst_meta)
 
         data_idx = append_or_create_parquet_file(
@@ -382,6 +428,7 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
             DEFAULT_DATA_PATH,
             contains_images=len(dst_meta.image_keys) > 0,
             aggr_root=dst_meta.root,
+            source_schema=table.schema,  # Preserve original schema with extension types
         )
 
     return data_idx
@@ -415,7 +462,10 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        df = pd.read_parquet(src_path)
+        # Read using PyArrow to preserve extension types
+        table = pq.read_table(src_path)
+        # Convert to DataFrame for manipulation
+        df = table.to_pandas()
         df = update_meta_data(
             df,
             dst_meta,
@@ -433,6 +483,7 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             DEFAULT_EPISODES_PATH,
             contains_images=False,
             aggr_root=dst_meta.root,
+            source_schema=table.schema,  # Preserve original schema with extension types
         )
 
     # Increment latest_duration by the total duration added from this source dataset
@@ -451,11 +502,15 @@ def append_or_create_parquet_file(
     default_path: str,
     contains_images: bool = False,
     aggr_root: Path = None,
+    source_schema: pa.Schema | None = None,
 ):
     """Appends data to an existing parquet file or creates a new one based on size constraints.
 
     Manages file rotation when size limits are exceeded to prevent individual files
     from becoming too large. Handles both regular parquet files and those containing images.
+
+    Uses PyArrow directly for writing to preserve extension types, following the same
+    approach as HuggingFace datasets library.
 
     Args:
         df: DataFrame to write to the parquet file.
@@ -466,6 +521,7 @@ def append_or_create_parquet_file(
         default_path: Format string for generating file paths.
         contains_images: Whether the data contains images requiring special handling.
         aggr_root: Root path for the aggregated dataset.
+        source_schema: Optional PyArrow schema from source file to preserve extension types.
 
     Returns:
         dict: Updated index dictionary with current chunk and file indices.
@@ -477,7 +533,12 @@ def append_or_create_parquet_file(
         if contains_images:
             to_parquet_with_hf_images(df, dst_path)
         else:
-            df.to_parquet(dst_path)
+            # Convert extension dtypes to lists so PyArrow can handle them
+            df_fixed = _convert_extension_dtypes_to_lists(df)
+            # Convert DataFrame to PyArrow table and write using PyArrow directly
+            # The schema will reconstruct extension types from the lists
+            table = pa.Table.from_pandas(df_fixed, schema=source_schema, preserve_index=False)
+            pq.write_table(table, dst_path)
         return idx
 
     src_size = get_parquet_file_size_in_mb(src_path)
@@ -487,17 +548,32 @@ def append_or_create_parquet_file(
         idx["chunk"], idx["file"] = update_chunk_file_indices(idx["chunk"], idx["file"], chunk_size)
         new_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
         new_path.parent.mkdir(parents=True, exist_ok=True)
-        final_df = df
+        # Convert extension dtypes to lists before writing
+        final_df = _convert_extension_dtypes_to_lists(df)
         target_path = new_path
+        # Use source schema for new file
+        target_schema = source_schema
     else:
-        existing_df = pd.read_parquet(dst_path)
-        final_df = pd.concat([existing_df, df], ignore_index=True)
+        # Read existing file using PyArrow to preserve schema
+        existing_table = pq.read_table(dst_path)
+        existing_df = existing_table.to_pandas()
+        # Convert extension dtypes to lists before concat to avoid dtype comparison issues
+        existing_df_fixed = _convert_extension_dtypes_to_lists(existing_df)
+        df_fixed = _convert_extension_dtypes_to_lists(df)
+        final_df = pd.concat([existing_df_fixed, df_fixed], ignore_index=True)
         target_path = dst_path
+        # Use existing schema to preserve extension types
+        target_schema = existing_table.schema
 
     if contains_images:
         to_parquet_with_hf_images(final_df, target_path)
     else:
-        final_df.to_parquet(target_path)
+        # Convert extension dtypes to lists so PyArrow can handle them
+        final_df_fixed = _convert_extension_dtypes_to_lists(final_df)
+        # Convert DataFrame to PyArrow table and write using PyArrow directly
+        # The schema will reconstruct extension types from the lists
+        table = pa.Table.from_pandas(final_df_fixed, schema=target_schema, preserve_index=False)
+        pq.write_table(table, target_path)
 
     return idx
 
