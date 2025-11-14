@@ -413,10 +413,8 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
-        # Read using PyArrow to preserve extension types
-        table = pq.read_table(src_path)
-        # Convert to DataFrame for manipulation
-        df = table.to_pandas()
+        # Read data with pandas (we'll convert extension dtypes to lists anyway)
+        df = pd.read_parquet(src_path)
         df = update_data_df(df, src_meta, dst_meta)
 
         data_idx = append_or_create_parquet_file(
@@ -428,7 +426,6 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
             DEFAULT_DATA_PATH,
             contains_images=len(dst_meta.image_keys) > 0,
             aggr_root=dst_meta.root,
-            source_schema=table.schema,  # Preserve original schema with extension types
         )
 
     return data_idx
@@ -462,10 +459,8 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        # Read using PyArrow to preserve extension types
-        table = pq.read_table(src_path)
-        # Convert to DataFrame for manipulation
-        df = table.to_pandas()
+        # Read data with pandas (we'll convert extension dtypes to lists anyway)
+        df = pd.read_parquet(src_path)
         df = update_meta_data(
             df,
             dst_meta,
@@ -483,7 +478,6 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             DEFAULT_EPISODES_PATH,
             contains_images=False,
             aggr_root=dst_meta.root,
-            source_schema=table.schema,  # Preserve original schema with extension types
         )
 
     # Increment latest_duration by the total duration added from this source dataset
@@ -502,7 +496,6 @@ def append_or_create_parquet_file(
     default_path: str,
     contains_images: bool = False,
     aggr_root: Path = None,
-    source_schema: pa.Schema | None = None,
 ):
     """Appends data to an existing parquet file or creates a new one based on size constraints.
 
@@ -514,19 +507,21 @@ def append_or_create_parquet_file(
 
     Args:
         df: DataFrame to write to the parquet file.
-        src_path: Path to the source file (used for size estimation).
+        src_path: Path to the source file (used for size estimation and schema extraction).
         idx: Dictionary containing current 'chunk' and 'file' indices.
         max_mb: Maximum allowed file size in MB before rotation.
         chunk_size: Maximum number of files per chunk before incrementing chunk index.
         default_path: Format string for generating file paths.
         contains_images: Whether the data contains images requiring special handling.
         aggr_root: Root path for the aggregated dataset.
-        source_schema: Optional PyArrow schema from source file to preserve extension types.
 
     Returns:
         dict: Updated index dictionary with current chunk and file indices.
     """
     dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+
+    # Get schema from source file (only reads metadata, not full table)
+    source_schema = pq.ParquetFile(src_path).schema
 
     if not dst_path.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
