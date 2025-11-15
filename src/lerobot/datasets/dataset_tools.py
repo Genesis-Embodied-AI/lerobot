@@ -498,7 +498,7 @@ def _copy_and_reindex_data(
         for src_path in file_to_episodes:
             df = pd.read_parquet(src_dataset.root / src_path)
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
-            task_series: pd.Series = df.loc[mask, "task_index"]
+            task_series: pd.Series = df[mask]["task_index"]
             all_task_indices.update(task_series.unique().tolist())
         tasks = [src_dataset.meta.tasks.iloc[idx].name for idx in all_task_indices]
         dst_meta.save_episode_tasks(list(set(tasks)))
@@ -527,7 +527,7 @@ def _copy_and_reindex_data(
             file_idx = src_ep["data/file_index"]
         else:
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
-            df = df.loc[mask].copy().reset_index(drop=True)
+            df = df[mask].copy().reset_index(drop=True)
 
             if len(df) == 0:
                 continue
