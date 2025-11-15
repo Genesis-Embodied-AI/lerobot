@@ -19,7 +19,6 @@ import logging
 import shutil
 from pathlib import Path
 
-import datasets
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -35,9 +34,7 @@ from lerobot.datasets.utils import (
     DEFAULT_EPISODES_PATH,
     DEFAULT_VIDEO_FILE_SIZE_IN_MB,
     DEFAULT_VIDEO_PATH,
-    embed_images,
     get_file_size_in_mb,
-    get_hf_features_from_features,
     get_parquet_file_size_in_mb,
     to_parquet_with_hf_images,
     update_chunk_file_indices,
@@ -48,67 +45,6 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
 
 
-def _read_parquet_with_hf_datasets(
-    path: Path, features: dict | None = None, convert_extension_dtypes: bool = True
-) -> pd.DataFrame:
-    """Read parquet file using HuggingFace datasets to preserve extension types.
-
-    This function reads parquet files using HuggingFace datasets library, which
-    correctly handles PyArrow extension types (like Array2D, Array3D, etc.) that
-    are used for multi-dimensional arrays. This avoids the issue where pandas
-    creates PandasArrayExtensionDtype that cannot be written back to parquet.
-
-    Args:
-        path: Path to the parquet file
-        features: Optional feature metadata dict to ensure correct schema
-        convert_extension_dtypes: If True, convert extension dtypes to lists for pandas operations
-
-    Returns:
-        DataFrame with extension types converted to lists (for pandas compatibility)
-    """
-    # Read using HuggingFace datasets to preserve extension types
-    hf_dataset = datasets.Dataset.from_parquet(str(path), features=features)
-    # Convert to pandas for manipulation
-    df = hf_dataset.to_pandas()
-
-    # Convert extension dtypes to lists to avoid pandas concatenation issues
-    if convert_extension_dtypes:
-        df = _convert_extension_dtypes_to_lists(df)
-
-    return df
-
-
-def _write_parquet_with_hf_datasets(
-    df: pd.DataFrame, path: Path, meta: LeRobotDatasetMetadata, contains_images: bool = False
-) -> None:
-    """Write DataFrame to parquet using HuggingFace datasets to preserve extension types.
-
-    This function uses the same pattern as LeRobotDataset._save_episode_data():
-    converts DataFrame to HuggingFace Dataset, then to Arrow format, preserving
-    extension types in the parquet schema.
-
-    Args:
-        df: DataFrame to write
-        path: Path where to write the parquet file
-        meta: Dataset metadata containing feature definitions
-        contains_images: Whether the data contains images requiring special handling
-    """
-    from lerobot.datasets.utils import embed_images, get_hf_features_from_features
-
-    hf_features = get_hf_features_from_features(meta.features)
-    # Convert DataFrame to dict format expected by Dataset.from_dict
-    ep_dict = df.to_dict(orient="list")
-    ep_dataset = datasets.Dataset.from_dict(ep_dict, features=hf_features, split="train")
-
-    if contains_images:
-        ep_dataset = embed_images(ep_dataset)
-
-    table = ep_dataset.with_format("arrow")[:]
-    writer = pq.ParquetWriter(path, schema=table.schema, compression="snappy", use_dictionary=True)
-    writer.write_table(table)
-    writer.close()
-
-
 def _convert_extension_dtypes_to_lists(df: pd.DataFrame) -> pd.DataFrame:
     """Convert pandas extension dtype columns to lists so PyArrow can handle them.
 
@@ -116,9 +52,6 @@ def _convert_extension_dtypes_to_lists(df: pd.DataFrame) -> pd.DataFrame:
     PandasArrayExtensionDtype which PyArrow cannot convert back. This function
     converts those columns to lists which PyArrow can handle.
 
-    NOTE: This function is kept for backward compatibility but should be replaced
-    by using _read_parquet_with_hf_datasets() and _write_parquet_with_hf_datasets()
-    which properly handle extension types.
 
     Args:
         df: DataFrame that may contain extension dtypes
@@ -477,15 +410,12 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
 
     unique_chunk_file_ids = sorted(unique_chunk_file_ids)
 
-    from lerobot.datasets.utils import get_hf_features_from_features
-
-    hf_features = get_hf_features_from_features(dst_meta.features)
-
     for src_chunk_idx, src_file_idx in unique_chunk_file_ids:
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
-        df = _read_parquet_with_hf_datasets(src_path, features=hf_features, convert_extension_dtypes=True)
+        df = pd.read_parquet(src_path)
+        df = _convert_extension_dtypes_to_lists(df)
         df = update_data_df(df, src_meta, dst_meta)
 
         data_idx = append_or_create_parquet_file(
@@ -497,7 +427,6 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
             DEFAULT_DATA_PATH,
             contains_images=len(dst_meta.image_keys) > 0,
             aggr_root=dst_meta.root,
-            dst_meta=dst_meta,
         )
 
     return data_idx
@@ -549,7 +478,6 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             DEFAULT_EPISODES_PATH,
             contains_images=False,
             aggr_root=dst_meta.root,
-            dst_meta=None,
         )
 
     # Increment latest_duration by the total duration added from this source dataset
@@ -568,13 +496,11 @@ def append_or_create_parquet_file(
     default_path: str,
     contains_images: bool = False,
     aggr_root: Path = None,
-    dst_meta: LeRobotDatasetMetadata | None = None,
 ):
     """Appends data to an existing parquet file or creates a new one based on size constraints.
 
     Manages file rotation when size limits are exceeded to prevent individual files
     from becoming too large. Handles both regular parquet files and those containing images.
-    Uses HuggingFace datasets pattern to preserve extension types.
 
     Args:
         df: DataFrame to write to the parquet file.
@@ -585,23 +511,19 @@ def append_or_create_parquet_file(
         default_path: Format string for generating file paths.
         contains_images: Whether the data contains images requiring special handling.
         aggr_root: Root path for the aggregated dataset.
-        dst_meta: Destination metadata (required for proper extension type handling).
 
     Returns:
         dict: Updated index dictionary with current chunk and file indices.
     """
     dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+    df_fixed = _convert_extension_dtypes_to_lists(df)
 
     if not dst_path.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        if dst_meta is not None:
-            _write_parquet_with_hf_datasets(df, dst_path, dst_meta, contains_images=contains_images)
+        if contains_images:
+            to_parquet_with_hf_images(df, dst_path)
         else:
-            if contains_images:
-                to_parquet_with_hf_images(df, dst_path)
-            else:
-                df_fixed = _convert_extension_dtypes_to_lists(df)
-                df_fixed.to_parquet(dst_path)
+            df_fixed.to_parquet(dst_path)
         return idx
 
     src_size = get_parquet_file_size_in_mb(src_path)
@@ -611,30 +533,18 @@ def append_or_create_parquet_file(
         idx["chunk"], idx["file"] = update_chunk_file_indices(idx["chunk"], idx["file"], chunk_size)
         new_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
         new_path.parent.mkdir(parents=True, exist_ok=True)
-        final_df = df
+        final_df = df_fixed
         target_path = new_path
     else:
-        if dst_meta is not None:
-            from lerobot.datasets.utils import get_hf_features_from_features
-
-            hf_features = get_hf_features_from_features(dst_meta.features)
-            existing_df = _read_parquet_with_hf_datasets(dst_path, features=hf_features, convert_extension_dtypes=True)
-        else:
-            existing_df = pd.read_parquet(dst_path)
-            existing_df = _convert_extension_dtypes_to_lists(existing_df)
-
-        df = _convert_extension_dtypes_to_lists(df)
-        final_df = pd.concat([existing_df, df], ignore_index=True)
+        existing_df = pd.read_parquet(dst_path)
+        existing_df_fixed = _convert_extension_dtypes_to_lists(existing_df)
+        final_df = pd.concat([existing_df_fixed, df_fixed], ignore_index=True)
         target_path = dst_path
 
-    if dst_meta is not None:
-        _write_parquet_with_hf_datasets(final_df, target_path, dst_meta, contains_images=contains_images)
+    if contains_images:
+        to_parquet_with_hf_images(final_df, target_path)
     else:
-        if contains_images:
-            to_parquet_with_hf_images(final_df, target_path)
-        else:
-            final_df_fixed = _convert_extension_dtypes_to_lists(final_df)
-            final_df_fixed.to_parquet(target_path)
+        final_df.to_parquet(target_path)
 
     return idx
 

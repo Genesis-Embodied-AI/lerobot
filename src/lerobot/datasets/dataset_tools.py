@@ -35,10 +35,7 @@ import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
-from lerobot.datasets.aggregate import (
-    _read_parquet_with_hf_datasets,
-    aggregate_datasets,
-)
+from lerobot.datasets.aggregate import aggregate_datasets
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
@@ -523,14 +520,11 @@ def _copy_and_reindex_data(
     global_index = 0
     episode_data_metadata: dict[int, dict] = {}
 
-    from lerobot.datasets.utils import get_hf_features_from_features
-
-    hf_features = get_hf_features_from_features(dst_meta.features)
-
     if dst_meta.tasks is None:
         all_task_indices = set()
         for src_path in file_to_episodes:
-            df = _read_parquet_with_hf_datasets(src_dataset.root / src_path, features=hf_features, convert_extension_dtypes=True)
+            df = pd.read_parquet(src_dataset.root / src_path)
+            df = _convert_extension_dtypes_to_numpy(df)
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
             task_series: pd.Series = df.loc[mask, "task_index"]
             all_task_indices.update(task_series.unique().tolist())
@@ -545,7 +539,8 @@ def _copy_and_reindex_data(
             task_mapping[old_task_idx] = new_task_idx
 
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        df = _read_parquet_with_hf_datasets(src_dataset.root / src_path, features=hf_features, convert_extension_dtypes=True)
+        df = pd.read_parquet(src_dataset.root / src_path)
+        df = _convert_extension_dtypes_to_numpy(df)
 
         all_episodes_in_file = set(df["episode_index"].unique())
         episodes_to_keep = file_to_episodes[src_path]
@@ -1009,14 +1004,8 @@ def _copy_data_with_feature_changes(
 
     frame_idx = 0
 
-    from lerobot.datasets.utils import get_hf_features_from_features
-
-    hf_features = get_hf_features_from_features(new_meta.features)
-
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        df = _read_parquet_with_hf_datasets(dataset.root / src_path, features=hf_features, convert_extension_dtypes=True).reset_index(
-            drop=True
-        )
+        df = pd.read_parquet(dataset.root / src_path).reset_index(drop=True)
 
         # Get chunk_idx and file_idx from the source file's first episode
         episodes_in_file = file_to_episodes[src_path]
