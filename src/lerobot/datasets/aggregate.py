@@ -103,7 +103,6 @@ def _write_parquet_with_hf_datasets(
     if contains_images:
         ep_dataset = embed_images(ep_dataset)
 
-    # Use the same pattern as lerobot_dataset.py:1291
     table = ep_dataset.with_format("arrow")[:]
     writer = pq.ParquetWriter(path, schema=table.schema, compression="snappy", use_dictionary=True)
     writer.write_table(table)
@@ -478,7 +477,6 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
 
     unique_chunk_file_ids = sorted(unique_chunk_file_ids)
 
-    # Get features for reading parquet files with correct extension types
     from lerobot.datasets.utils import get_hf_features_from_features
 
     hf_features = get_hf_features_from_features(dst_meta.features)
@@ -487,8 +485,6 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
-        # Read using HuggingFace datasets to preserve extension types
-        # convert_extension_dtypes=True ensures pandas compatibility for operations
         df = _read_parquet_with_hf_datasets(src_path, features=hf_features, convert_extension_dtypes=True)
         df = update_data_df(df, src_meta, dst_meta)
 
@@ -535,7 +531,6 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        # For metadata files, we can use regular pandas read since they don't have extension types
         df = pd.read_parquet(src_path)
         df = update_meta_data(
             df,
@@ -554,7 +549,7 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             DEFAULT_EPISODES_PATH,
             contains_images=False,
             aggr_root=dst_meta.root,
-            dst_meta=None,  # Metadata files don't need extension type handling
+            dst_meta=None,
         )
 
     # Increment latest_duration by the total duration added from this source dataset
@@ -600,10 +595,8 @@ def append_or_create_parquet_file(
     if not dst_path.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         if dst_meta is not None:
-            # Use HuggingFace datasets pattern to preserve extension types
             _write_parquet_with_hf_datasets(df, dst_path, dst_meta, contains_images=contains_images)
         else:
-            # Fallback to old method if metadata not provided
             if contains_images:
                 to_parquet_with_hf_images(df, dst_path)
             else:
@@ -621,7 +614,6 @@ def append_or_create_parquet_file(
         final_df = df
         target_path = new_path
     else:
-        # Read existing file using HuggingFace datasets to preserve extension types
         if dst_meta is not None:
             from lerobot.datasets.utils import get_hf_features_from_features
 
@@ -631,16 +623,13 @@ def append_or_create_parquet_file(
             existing_df = pd.read_parquet(dst_path)
             existing_df = _convert_extension_dtypes_to_lists(existing_df)
 
-        # Ensure both DataFrames have extension dtypes converted to lists before concatenation
         df = _convert_extension_dtypes_to_lists(df)
         final_df = pd.concat([existing_df, df], ignore_index=True)
         target_path = dst_path
 
     if dst_meta is not None:
-        # Use HuggingFace datasets pattern to preserve extension types
         _write_parquet_with_hf_datasets(final_df, target_path, dst_meta, contains_images=contains_images)
     else:
-        # Fallback to old method if metadata not provided
         if contains_images:
             to_parquet_with_hf_images(final_df, target_path)
         else:

@@ -523,7 +523,6 @@ def _copy_and_reindex_data(
     global_index = 0
     episode_data_metadata: dict[int, dict] = {}
 
-    # Get features for reading parquet files with correct extension types
     from lerobot.datasets.utils import get_hf_features_from_features
 
     hf_features = get_hf_features_from_features(dst_meta.features)
@@ -531,8 +530,6 @@ def _copy_and_reindex_data(
     if dst_meta.tasks is None:
         all_task_indices = set()
         for src_path in file_to_episodes:
-            # Read using HuggingFace datasets to preserve extension types
-            # convert_extension_dtypes=True ensures pandas compatibility for operations
             df = _read_parquet_with_hf_datasets(src_dataset.root / src_path, features=hf_features, convert_extension_dtypes=True)
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
             task_series: pd.Series = df.loc[mask, "task_index"]
@@ -548,8 +545,6 @@ def _copy_and_reindex_data(
             task_mapping[old_task_idx] = new_task_idx
 
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        # Read using HuggingFace datasets to preserve extension types
-        # convert_extension_dtypes=True ensures pandas compatibility for operations
         df = _read_parquet_with_hf_datasets(src_dataset.root / src_path, features=hf_features, convert_extension_dtypes=True)
 
         all_episodes_in_file = set(df["episode_index"].unique())
@@ -1014,14 +1009,11 @@ def _copy_data_with_feature_changes(
 
     frame_idx = 0
 
-    # Get features for reading parquet files with correct extension types
     from lerobot.datasets.utils import get_hf_features_from_features
 
     hf_features = get_hf_features_from_features(new_meta.features)
 
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        # Read using HuggingFace datasets to preserve extension types
-        # convert_extension_dtypes=True ensures pandas compatibility for operations
         df = _read_parquet_with_hf_datasets(dataset.root / src_path, features=hf_features, convert_extension_dtypes=True).reset_index(
             drop=True
         )
