@@ -35,7 +35,10 @@ import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
-from lerobot.datasets.aggregate import aggregate_datasets
+from lerobot.datasets.aggregate import (
+    _read_parquet_with_hf_datasets,
+    aggregate_datasets,
+)
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
@@ -465,6 +468,33 @@ def _fractions_to_episode_indices(
     return result
 
 
+def _convert_extension_dtypes_to_numpy(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert pandas extension dtype columns to numpy dtypes to avoid comparison issues.
+
+    When pandas reads parquet files with HuggingFace extension metadata, it creates
+    PandasArrayExtensionDtype which can cause AttributeError when using boolean indexing.
+    This function converts those columns to numpy dtypes.
+
+    Args:
+        df: DataFrame that may contain extension dtypes
+
+    Returns:
+        DataFrame with extension dtypes converted to numpy dtypes
+    """
+    df_fixed = df.copy()
+
+    for col in df_fixed.columns:
+        col_series = df_fixed[col]
+        if pd.api.types.is_extension_array_dtype(col_series):
+            # Convert extension dtype to numpy dtype by converting to numpy array first
+            # This preserves the data while converting the dtype
+            numpy_array = col_series.to_numpy()
+            # Infer the appropriate numpy dtype from the array
+            df_fixed[col] = pd.Series(numpy_array, dtype=numpy_array.dtype, index=df_fixed.index)
+
+    return df_fixed
+
+
 def _copy_and_reindex_data(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
@@ -493,12 +523,19 @@ def _copy_and_reindex_data(
     global_index = 0
     episode_data_metadata: dict[int, dict] = {}
 
+    # Get features for reading parquet files with correct extension types
+    from lerobot.datasets.utils import get_hf_features_from_features
+
+    hf_features = get_hf_features_from_features(dst_meta.features)
+
     if dst_meta.tasks is None:
         all_task_indices = set()
         for src_path in file_to_episodes:
-            df = pd.read_parquet(src_dataset.root / src_path)
+            # Read using HuggingFace datasets to preserve extension types
+            # convert_extension_dtypes=True ensures pandas compatibility for operations
+            df = _read_parquet_with_hf_datasets(src_dataset.root / src_path, features=hf_features, convert_extension_dtypes=True)
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
-            task_series: pd.Series = df[mask]["task_index"]
+            task_series: pd.Series = df.loc[mask, "task_index"]
             all_task_indices.update(task_series.unique().tolist())
         tasks = [src_dataset.meta.tasks.iloc[idx].name for idx in all_task_indices]
         dst_meta.save_episode_tasks(list(set(tasks)))
@@ -511,7 +548,9 @@ def _copy_and_reindex_data(
             task_mapping[old_task_idx] = new_task_idx
 
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        df = pd.read_parquet(src_dataset.root / src_path)
+        # Read using HuggingFace datasets to preserve extension types
+        # convert_extension_dtypes=True ensures pandas compatibility for operations
+        df = _read_parquet_with_hf_datasets(src_dataset.root / src_path, features=hf_features, convert_extension_dtypes=True)
 
         all_episodes_in_file = set(df["episode_index"].unique())
         episodes_to_keep = file_to_episodes[src_path]
@@ -527,7 +566,7 @@ def _copy_and_reindex_data(
             file_idx = src_ep["data/file_index"]
         else:
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
-            df = df[mask].copy().reset_index(drop=True)
+            df = df.loc[mask].copy().reset_index(drop=True)
 
             if len(df) == 0:
                 continue
@@ -975,8 +1014,17 @@ def _copy_data_with_feature_changes(
 
     frame_idx = 0
 
+    # Get features for reading parquet files with correct extension types
+    from lerobot.datasets.utils import get_hf_features_from_features
+
+    hf_features = get_hf_features_from_features(new_meta.features)
+
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        df = pd.read_parquet(dataset.root / src_path).reset_index(drop=True)
+        # Read using HuggingFace datasets to preserve extension types
+        # convert_extension_dtypes=True ensures pandas compatibility for operations
+        df = _read_parquet_with_hf_datasets(dataset.root / src_path, features=hf_features, convert_extension_dtypes=True).reset_index(
+            drop=True
+        )
 
         # Get chunk_idx and file_idx from the source file's first episode
         episodes_in_file = file_to_episodes[src_path]

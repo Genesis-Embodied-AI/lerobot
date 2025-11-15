@@ -757,6 +757,41 @@ def test_split_preserves_stats(sample_dataset, tmp_path):
             assert "std" in split_ds.meta.stats[feature]
 
 
+def test_split_with_extension_dtypes(sample_dataset, tmp_path):
+    """Test that splitting works correctly with parquet files that may have extension dtypes.
+
+    This test ensures that the fix for chained indexing (using .loc instead of df[mask]["column"])
+    works correctly and prevents AttributeError with PandasArrayExtensionDtype.
+    """
+    splits = {"task1": [0]}
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+
+        def mock_snapshot(repo_id, **kwargs):
+            if "task1" in repo_id:
+                return str(tmp_path / f"{sample_dataset.repo_id}_task1")
+            return str(kwargs.get("local_dir", tmp_path))
+
+        mock_snapshot_download.side_effect = mock_snapshot
+
+        # This should not raise AttributeError even if parquet files have extension dtypes
+        result = split_dataset(
+            sample_dataset,
+            splits=splits,
+            output_dir=tmp_path,
+        )
+
+    assert "task1" in result
+    assert result["task1"].meta.total_episodes == 1
+    assert result["task1"].meta.total_frames == 10
+    # Verify the split dataset can be accessed
+    assert len(result["task1"]) == 10
+
+
 def test_merge_three_datasets(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
     """Test merging three datasets."""
     features = {
