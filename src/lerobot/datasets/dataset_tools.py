@@ -465,33 +465,6 @@ def _fractions_to_episode_indices(
     return result
 
 
-def _convert_extension_dtypes_to_numpy(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert pandas extension dtype columns to numpy dtypes to avoid comparison issues.
-
-    When pandas reads parquet files with HuggingFace extension metadata, it creates
-    PandasArrayExtensionDtype which can cause AttributeError when using boolean indexing.
-    This function converts those columns to numpy dtypes.
-
-    Args:
-        df: DataFrame that may contain extension dtypes
-
-    Returns:
-        DataFrame with extension dtypes converted to numpy dtypes
-    """
-    df_fixed = df.copy()
-
-    for col in df_fixed.columns:
-        col_series = df_fixed[col]
-        if pd.api.types.is_extension_array_dtype(col_series):
-            # Convert extension dtype to numpy dtype by converting to numpy array first
-            # This preserves the data while converting the dtype
-            numpy_array = col_series.to_numpy()
-            # Infer the appropriate numpy dtype from the array
-            df_fixed[col] = pd.Series(numpy_array, dtype=numpy_array.dtype, index=df_fixed.index)
-
-    return df_fixed
-
-
 def _copy_and_reindex_data(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
@@ -524,7 +497,6 @@ def _copy_and_reindex_data(
         all_task_indices = set()
         for src_path in file_to_episodes:
             df = pd.read_parquet(src_dataset.root / src_path)
-            df = _convert_extension_dtypes_to_numpy(df)
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
             task_series: pd.Series = df.loc[mask, "task_index"]
             all_task_indices.update(task_series.unique().tolist())
@@ -540,7 +512,6 @@ def _copy_and_reindex_data(
 
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
         df = pd.read_parquet(src_dataset.root / src_path)
-        df = _convert_extension_dtypes_to_numpy(df)
 
         all_episodes_in_file = set(df["episode_index"].unique())
         episodes_to_keep = file_to_episodes[src_path]
