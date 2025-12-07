@@ -39,6 +39,7 @@ from lerobot.datasets.aggregate import aggregate_datasets
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
+    DATA_DIR,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
@@ -954,6 +955,28 @@ def _save_data_chunk(
 
     return chunk_idx, file_idx, episode_metadata
 
+def fix_array2d(col, shape):
+    """Fix columns that should match Array2DExtensionType."""
+    target_rows, target_cols = shape  # e.g. [1,6] or [2,6]
+
+    fixed = []
+    for v in col:
+        # v is typically array([array([...])], dtype=object)
+        if isinstance(v, np.ndarray) and v.dtype == object and v.size == 1:
+            v = v[0]  # unpack inner array
+
+        v = np.asarray(v, dtype=np.float32)
+
+        # reshape into Array2D required shape
+        if v.ndim == 1 and v.shape[0] == target_cols:
+            v = v.reshape(target_rows, target_cols)
+        elif v.shape != (target_rows, target_cols):
+            raise ValueError(f"Bad shape {v.shape}, expected {(target_rows, target_cols)}")
+
+        fixed.append(v)
+
+    return fixed  # keep as python list (HF will pack into Array2D)
+
 
 def _copy_data_with_feature_changes(
     dataset: LeRobotDataset,
@@ -962,28 +985,29 @@ def _copy_data_with_feature_changes(
     remove_features: list[str] | None = None,
 ) -> None:
     """Copy data while adding or removing features."""
-    if dataset.meta.episodes is None:
-        dataset.meta.episodes = load_episodes(dataset.meta.root)
+    data_dir = dataset.root / DATA_DIR
+    parquet_files = sorted(data_dir.glob("*/*.parquet"))
 
-    # Map file paths to episode indices to extract chunk/file indices
-    file_to_episodes: dict[Path, set[int]] = {}
-    for ep_idx in range(dataset.meta.total_episodes):
-        file_path = dataset.meta.get_data_file_path(ep_idx)
-        if file_path not in file_to_episodes:
-            file_to_episodes[file_path] = set()
-        file_to_episodes[file_path].add(ep_idx)
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in {data_dir}")
 
     frame_idx = 0
 
-    for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        df = pd.read_parquet(dataset.root / src_path).reset_index(drop=True)
+    for src_path in tqdm(parquet_files, desc="Processing data files"):
+        df = pd.read_parquet(src_path).reset_index(drop=True)
 
-        # Get chunk_idx and file_idx from the source file's first episode
-        episodes_in_file = file_to_episodes[src_path]
-        first_ep_idx = min(episodes_in_file)
-        src_ep = dataset.meta.episodes[first_ep_idx]
-        chunk_idx = src_ep["data/chunk_index"]
-        file_idx = src_ep["data/file_index"]
+        for col, info in new_meta.features.items():
+            if col in df and df[col].dtype == object:
+                print(f"[fix] repairing 2D feature {col}")
+                df[col] = fix_array2d(df[col], info["shape"])
+
+
+        relative_path = src_path.relative_to(dataset.root)
+        chunk_dir = relative_path.parts[1]
+        file_name = relative_path.parts[2]
+
+        chunk_idx = int(chunk_dir.split("-")[1])
+        file_idx = int(file_name.split("-")[1].split(".")[0])
 
         if remove_features:
             df = df.drop(columns=remove_features, errors="ignore")
@@ -1003,16 +1027,12 @@ def _copy_data_with_feature_changes(
                     df[feature_name] = feature_values
                 else:
                     feature_slice = values[frame_idx:end_idx]
-                    if len(feature_slice.shape) > 1 and feature_slice.shape[1] == 1:
-                        df[feature_name] = feature_slice.flatten()
-                    else:
-                        df[feature_name] = feature_slice
+                    df[feature_name] = list(feature_slice)
             frame_idx = end_idx
 
-        # Write using the preserved chunk_idx and file_idx from source
+        # Write using the same chunk/file structure as source
         dst_path = new_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-
         _write_parquet(df, dst_path, new_meta)
 
     _copy_episodes_metadata_and_stats(dataset, new_meta)
