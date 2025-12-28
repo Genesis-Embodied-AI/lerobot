@@ -18,6 +18,7 @@ import importlib
 import logging
 import shutil
 import tempfile
+import time
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -192,13 +193,18 @@ class VideoDecoderCache:
         else:
             raise ImportError("torchcodec is required but not available.")
 
-        video_path = str(video_path)
+        # Normalize path: resolve to absolute path to avoid issues with symlinks,
+        # relative paths, and network filesystem mount point changes
+        video_path_obj = Path(video_path)
+        video_path = str(video_path_obj.resolve())
 
         with self._lock:
             if video_path in self._cache:
                 # Move to end (most recently used)
                 decoder, file_handle = self._cache.pop(video_path)
                 self._cache[video_path] = (decoder, file_handle)
+                # Note: We don't validate the cached handle here because that would require
+                # I/O operations while holding the lock. Validation happens on use in decode_video_frames_torchcodec.
                 return decoder
 
             # Evict least recently used if cache is full
@@ -209,11 +215,92 @@ class VideoDecoderCache:
                 except Exception:
                     pass
 
-            # Create new decoder
-            file_handle = fsspec.open(video_path).__enter__()
-            decoder = VideoDecoder(file_handle, seek_mode="approximate")
-            self._cache[video_path] = (decoder, file_handle)
-            return decoder
+            # Create new decoder with retry logic for transient filesystem issues
+            max_retries = 3
+            retry_delay = 0.1  # Start with 100ms delay
+            
+            for attempt in range(max_retries):
+                try:
+                    # Use the already-resolved path object for existence check
+                    # This ensures consistency between Path.exists() and fsspec.open()
+                    if not video_path_obj.exists():
+                        if attempt < max_retries - 1:
+                            delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                            logging.warning(
+                                f"Video file not found (attempt {attempt + 1}/{max_retries}): {video_path}. "
+                                f"Retrying in {delay:.2f}s..."
+                            )
+                            time.sleep(delay)
+                            # Re-resolve path in case mount point changed
+                            video_path_obj = Path(video_path).resolve()
+                            video_path = str(video_path_obj)
+                            continue
+                        else:
+                            raise FileNotFoundError(
+                                f"Video file not found after {max_retries} attempts: {video_path}\n"
+                                f"This may occur if the file was deleted, moved, or the filesystem is unavailable."
+                            )
+                    
+                    # Attempt to open the file using the resolved absolute path
+                    # fsspec.open() works better with absolute paths on network filesystems
+                    file_handle = fsspec.open(video_path, mode="rb").__enter__()
+                except FileNotFoundError as e:
+                    if attempt < max_retries - 1:
+                        delay = retry_delay * (2 ** attempt)
+                        logging.warning(
+                            f"FileNotFoundError opening video file (attempt {attempt + 1}/{max_retries}): {video_path}. "
+                            f"Retrying in {delay:.2f}s... Error: {e}"
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Provide a more informative error message
+                        raise FileNotFoundError(
+                            f"Video file not found after {max_retries} attempts: {video_path}\n"
+                            f"This may occur if the file was deleted, moved, or the filesystem is unavailable.\n"
+                            f"Original error: {e}"
+                        ) from e
+                except OSError as e:
+                    if attempt < max_retries - 1:
+                        delay = retry_delay * (2 ** attempt)
+                        logging.warning(
+                            f"OSError opening video file (attempt {attempt + 1}/{max_retries}): {video_path}. "
+                            f"Retrying in {delay:.2f}s... Error: {e}"
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Handle other filesystem errors (e.g., network issues, permission errors)
+                        raise OSError(
+                            f"Failed to open video file after {max_retries} attempts: {video_path}\n"
+                            f"This may occur due to filesystem issues, network problems, or permission errors.\n"
+                            f"Original error: {e}"
+                        ) from e
+                
+                # Successfully opened file, try to create decoder
+                try:
+                    decoder = VideoDecoder(file_handle, seek_mode="approximate")
+                    self._cache[video_path] = (decoder, file_handle)
+                    return decoder
+                except Exception as e:
+                    # If decoder creation fails, close the file handle to avoid resource leaks
+                    try:
+                        file_handle.close()
+                    except Exception:
+                        pass
+                    if attempt < max_retries - 1:
+                        delay = retry_delay * (2 ** attempt)
+                        logging.warning(
+                            f"Failed to create VideoDecoder (attempt {attempt + 1}/{max_retries}): {video_path}. "
+                            f"Retrying in {delay:.2f}s... Error: {e}"
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Failed to create VideoDecoder after {max_retries} attempts: {video_path}\n"
+                            f"Original error: {e}"
+                        ) from e
 
     def clear(self):
         """Clear the cache and close file handles."""
@@ -226,6 +313,20 @@ class VideoDecoderCache:
         """Return the number of cached decoders."""
         with self._lock:
             return len(self._cache)
+
+    def remove_decoder(self, video_path: str):
+        """Remove a decoder from the cache and close its file handle.
+        
+        This is useful when a cached decoder becomes invalid (e.g., file was deleted).
+        """
+        video_path = str(video_path)
+        with self._lock:
+            if video_path in self._cache:
+                _, file_handle = self._cache.pop(video_path)
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
 
 
 class FrameTimestampError(ValueError):
@@ -264,19 +365,52 @@ def decode_video_frames_torchcodec(
     if decoder_cache is None:
         decoder_cache = _default_decoder_cache
 
+    # Normalize path: resolve to absolute path for consistency
+    # This ensures the same file always uses the same cache key, even if accessed via different paths
+    video_path_obj = Path(video_path)
+    video_path_str = str(video_path_obj.resolve())
+    
     # Use cached decoder instead of creating new one each time
-    decoder = decoder_cache.get_decoder(str(video_path))
+    # If the decoder fails (e.g., file was deleted after caching or network filesystem reconnected),
+    # remove it from cache and retry
+    max_retries = 3
+    retry_delay = 0.1  # Start with 100ms delay
+    for attempt in range(max_retries):
+        try:
+            decoder = decoder_cache.get_decoder(video_path_str)
+            
+            loaded_ts = []
+            loaded_frames = []
 
-    loaded_ts = []
-    loaded_frames = []
-
-    # get metadata for frame information
-    metadata = decoder.metadata
-    average_fps = metadata.average_fps
-    # convert timestamps to frame indices
-    frame_indices = [round(ts * average_fps) for ts in timestamps]
-    # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+            # get metadata for frame information
+            metadata = decoder.metadata
+            average_fps = metadata.average_fps
+            # convert timestamps to frame indices
+            frame_indices = [round(ts * average_fps) for ts in timestamps]
+            # retrieve frames based on indices
+            frames_batch = decoder.get_frames_at(indices=frame_indices)
+            break  # Success, exit retry loop
+        except (FileNotFoundError, OSError, RuntimeError) as e:
+            # If decoder fails, remove it from cache and retry
+            # This handles cases where:
+            # - File handle became stale (network filesystem reconnected)
+            # - File was temporarily unavailable
+            # - Decoder's internal state is corrupted
+            if attempt < max_retries - 1:
+                delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                logging.warning(
+                    f"Decoder failed for {video_path_str} (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Removing from cache and retrying in {delay:.2f}s..."
+                )
+                decoder_cache.remove_decoder(video_path_str)
+                # Re-resolve path in case mount point changed during retry
+                video_path_obj = Path(video_path).resolve()
+                video_path_str = str(video_path_obj)
+                time.sleep(delay)
+                continue
+            else:
+                # Final attempt failed, re-raise the error
+                raise
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)
