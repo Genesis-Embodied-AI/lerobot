@@ -1034,7 +1034,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
-                item[key] = val
+                item[key.replace("marvin_robot_state", "ctrl")] = val
 
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
