@@ -425,10 +425,10 @@ def encode_video_frames(
     # Codec-specific options
     if vcodec == "libsvtav1":
         # Build svtav1-params string
-        # preset=12 is the highest preset intended for production use
-        # (preset 13 exists but is only for debugging/fast convex-hull encoding)
+        # Looking at svtav1 documentation: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
+        # it looks like preset 10 is the fastest that is well documented.
         # lp=6 is the highest level of parallelism
-        preset = str(preset) if preset is not None else "12"
+        preset = str(preset) if preset is not None else "10"
         svtav1_params = f"preset={preset}:lp=6"
         if fast_decode:
             svtav1_params += f":fast-decode={fast_decode}"
