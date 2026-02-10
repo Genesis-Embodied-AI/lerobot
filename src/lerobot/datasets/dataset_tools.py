@@ -955,27 +955,18 @@ def _save_data_chunk(
 
     return chunk_idx, file_idx, episode_metadata
 
-def fix_array2d(col, shape):
-    """Fix columns that should match Array2DExtensionType."""
-    target_rows, target_cols = shape  # e.g. [1,6] or [2,6]
-
+def fix_arraynd(col):
+    """Fix columns that should match ArrayNDExtensionType."""
     fixed = []
     for v in col:
-        # v is typically array([array([...])], dtype=object)
-        if isinstance(v, np.ndarray) and v.dtype == object and v.size == 1:
-            v = v[0]  # unpack inner array
+        fixed.append(to_ndarray(v, dtype=np.float32))
 
-        v = np.asarray(v, dtype=np.float32)
+    return fixed  # keep as python list (HF will pack into ArrayND)
 
-        # reshape into Array2D required shape
-        if v.ndim == 1 and v.shape[0] == target_cols:
-            v = v.reshape(target_rows, target_cols)
-        elif v.shape != (target_rows, target_cols):
-            raise ValueError(f"Bad shape {v.shape}, expected {(target_rows, target_cols)}")
-
-        fixed.append(v)
-
-    return fixed  # keep as python list (HF will pack into Array2D)
+def to_ndarray(nested, dtype=np.float32):
+    if nested.dtype in [float, int]:
+        return nested
+    return np.stack([to_ndarray(x) for x in nested], dtype=dtype)
 
 
 def _copy_data_with_feature_changes(
@@ -998,8 +989,8 @@ def _copy_data_with_feature_changes(
 
         for col, info in new_meta.features.items():
             if col in df and df[col].dtype == object:
-                print(f"[fix] repairing 2D feature {col}")
-                df[col] = fix_array2d(df[col], info["shape"])
+                print(f"[fix] repairing ND feature {col}")
+                df[col] = fix_arraynd(df[col])
 
 
         relative_path = src_path.relative_to(dataset.root)
