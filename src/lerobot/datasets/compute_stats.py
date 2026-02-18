@@ -17,6 +17,7 @@ import numpy as np
 
 from lerobot.datasets.utils import load_image_as_numpy
 from lerobot.datasets.utils import DEFAULT_FEATURES
+from lerobot.datasets.dataset_tools import to_ndarray
 
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
@@ -580,6 +581,10 @@ def _assert_type_and_shape(stats_list: list[dict[str, dict]]):
 
 def aggregate_feature_stats(stats_ft_list: list[dict[str, dict]]) -> dict[str, dict[str, np.ndarray]]:
     """Aggregates stats for a single feature."""
+    stats_ft_list = [
+        {k: to_ndarray(v) for k, v in s.items()} for s in stats_ft_list
+    ]  # otherwise, stats become array of objects
+
     means = np.stack([s["mean"] for s in stats_ft_list])
     variances = np.stack([s["std"] ** 2 for s in stats_ft_list])
     counts = np.stack([s["count"] for s in stats_ft_list])
