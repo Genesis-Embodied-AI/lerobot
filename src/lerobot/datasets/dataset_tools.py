@@ -52,6 +52,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.datasets.dataset_tools import to_ndarray
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -935,7 +936,8 @@ def _write_parquet(df: pd.DataFrame, path: Path, meta: LeRobotDatasetMetadata) -
     from lerobot.datasets.utils import embed_images, get_hf_features_from_features
 
     hf_features = get_hf_features_from_features(meta.features)
-    ep_dataset = datasets.Dataset.from_dict(df.to_dict(orient="list"), features=hf_features, split="train")
+    df_dict = {k: to_ndarray(v) for k, v in df.items()}
+    ep_dataset = datasets.Dataset.from_dict(df_dict, features=hf_features, split="train")
 
     if len(meta.image_keys) > 0:
         ep_dataset = embed_images(ep_dataset)
